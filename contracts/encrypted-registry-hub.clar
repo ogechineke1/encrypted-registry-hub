@@ -331,3 +331,161 @@
   true
 )
 
+;; Audit trail mapping for security monitoring
+(define-map audit-trail
+  { audit-id: uint }
+  {
+    entry-id: uint,
+    action-type: (string-ascii 32),
+    performer-address: principal,
+    timestamp: uint,
+    previous-state-hash: (buff 32),
+    new-state-hash: (buff 32),
+    additional-metadata: (string-ascii 128)
+  }
+)
+
+;; Counter for audit entries
+(define-data-var total-audit-entries uint u0)
+
+;; Function to create comprehensive audit trail entry with security validation
+(define-public (create-audit-entry 
+  (target-entry-id uint)
+  (action-type (string-ascii 32))
+  (previous-state-hash (buff 32))
+  (new-state-hash (buff 32))
+  (metadata (string-ascii 128))
+)
+  (let
+    (
+      (new-audit-id (+ (var-get total-audit-entries) u1))
+      (existing-entry (unwrap! (map-get? data-registry { entry-id: target-entry-id }) ERROR_ENTRY_NOT_FOUND))
+    )
+    ;; Security and validation checks
+    (asserts! (entry-exists-check target-entry-id) ERROR_ENTRY_NOT_FOUND)
+    (asserts! 
+      (or 
+        (is-eq (get authority-address existing-entry) tx-sender)
+        (is-some (map-get? access-permissions { entry-id: target-entry-id, user-address: tx-sender }))
+        (is-eq master-authority tx-sender)
+      ) 
+      ERROR_ACCESS_DENIED
+    )
+    (asserts! (> (len action-type) u0) ERROR_INVALID_PARAMETER_LENGTH)
+    (asserts! (< (len action-type) u33) ERROR_INVALID_PARAMETER_LENGTH)
+    (asserts! (is-eq (len previous-state-hash) u32) ERROR_INVALID_PARAMETER_LENGTH)
+    (asserts! (is-eq (len new-state-hash) u32) ERROR_INVALID_PARAMETER_LENGTH)
+    (asserts! (< (len metadata) u129) ERROR_INVALID_PARAMETER_LENGTH)
+
+    ;; Validate action type against allowed operations
+    (asserts! 
+      (or 
+        (is-eq action-type "CREATE")
+        (is-eq action-type "MODIFY")
+        (is-eq action-type "TRANSFER")
+        (is-eq action-type "ACCESS_GRANT")
+        (is-eq action-type "ACCESS_REVOKE")
+        (is-eq action-type "FREEZE")
+        (is-eq action-type "UNFREEZE")
+      ) 
+      ERROR_INVALID_TAG_FORMAT
+    )
+
+    ;; Create audit trail entry
+    (map-insert audit-trail
+      { audit-id: new-audit-id }
+      {
+        entry-id: target-entry-id,
+        action-type: action-type,
+        performer-address: tx-sender,
+        timestamp: block-height,
+        previous-state-hash: previous-state-hash,
+        new-state-hash: new-state-hash,
+        additional-metadata: metadata
+      }
+    )
+
+    ;; Update audit counter
+    (var-set total-audit-entries new-audit-id)
+    (ok new-audit-id)
+  )
+)
+
+;; Additional mapping for entry freeze status
+(define-map entry-freeze-status
+  { entry-id: uint }
+  { 
+    is-frozen: bool,
+    freeze-timestamp: uint,
+    freeze-authority: principal,
+    freeze-reason: (string-ascii 64)
+  }
+)
+
+;; Function to freeze or unfreeze entry with security validation
+(define-public (toggle-entry-freeze-status 
+  (entry-id uint)
+  (should-freeze bool)
+  (freeze-reason (string-ascii 64))
+)
+  (let
+    (
+      (existing-entry (unwrap! (map-get? data-registry { entry-id: entry-id }) ERROR_ENTRY_NOT_FOUND))
+      (current-freeze-status (map-get? entry-freeze-status { entry-id: entry-id }))
+    )
+    ;; Authority and validation checks
+    (asserts! (entry-exists-check entry-id) ERROR_ENTRY_NOT_FOUND)
+    (asserts! (or 
+      (is-eq (get authority-address existing-entry) tx-sender)
+      (is-eq master-authority tx-sender)
+    ) ERROR_ACCESS_DENIED)
+    (asserts! (> (len freeze-reason) u0) ERROR_INVALID_PARAMETER_LENGTH)
+    (asserts! (< (len freeze-reason) u65) ERROR_INVALID_PARAMETER_LENGTH)
+
+    ;; Check current freeze status and apply changes
+    (if should-freeze
+      ;; Freeze entry
+      (begin
+        (asserts! 
+          (or 
+            (is-none current-freeze-status)
+            (not (get is-frozen (unwrap-panic current-freeze-status)))
+          ) 
+          ERROR_DUPLICATE_ENTRY
+        )
+        (map-set entry-freeze-status
+          { entry-id: entry-id }
+          {
+            is-frozen: true,
+            freeze-timestamp: block-height,
+            freeze-authority: tx-sender,
+            freeze-reason: freeze-reason
+          }
+        )
+        (ok { action: "frozen", entry-id: entry-id })
+      )
+      ;; Unfreeze entry
+      (begin
+        (asserts! 
+          (and 
+            (is-some current-freeze-status)
+            (get is-frozen (unwrap-panic current-freeze-status))
+          ) 
+          ERROR_ENTRY_NOT_FOUND
+        )
+        (map-set entry-freeze-status
+          { entry-id: entry-id }
+          {
+            is-frozen: false,
+            freeze-timestamp: block-height,
+            freeze-authority: tx-sender,
+            freeze-reason: freeze-reason
+          }
+        )
+        (ok { action: "unfrozen", entry-id: entry-id })
+      )
+    )
+  )
+)
+
+
